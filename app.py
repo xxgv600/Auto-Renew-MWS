@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 2026-11-01 传输兜底版：基于 app__3.py，仅改传输层，其余逻辑、环境变量名一字未动。
+# 背景：10-31 那轮日志里，代理测试通过，但所有 curl_cffi 请求（续期 API、Discord OAuth、TG）
+# 全报 SSL 握手被掐断，连 Telegram 都不通——坏的是同一条出路（代理节点或 chrome 指纹），
+# 不是 MWS 站点、不是 COOKIE（当时 COOKIE 到 11-05 才过期，且失败是异常不是 401）。
+# 兜底：先按原配置（代理+chrome 指纹）试，失败则改直连+无指纹重试一次，
+# 并把哪条路通了打到日志里，下轮日志即可定性是代理问题还是指纹问题。
+# 部署：改名回 app.py，覆盖仓库原文件，手动触发一次验证。
 
 import os
 import re
@@ -44,6 +51,32 @@ def build_proxies():
         return {"http": PROXY_SERVER, "https": PROXY_SERVER}
     return None
 
+# ------------- 传输兜底 -------------
+def transport_attempts():
+    """按顺序返回传输配置：先原配置（代理+chrome 指纹），再直连+无指纹"""
+    attempts = []
+    if IS_PROXY:
+        attempts.append({"label": "代理+chrome指纹", "proxies": build_proxies(), "impersonate": "chrome"})
+    attempts.append({"label": "直连+无指纹", "proxies": None, "impersonate": None})
+    return attempts
+
+def request_with_fallback(method, url, **kwargs):
+    """按传输配置顺序尝试，返回第一个成功的 Response；全部失败则抛出最后一个异常"""
+    last_exc = None
+    for att in transport_attempts():
+        kw = dict(kwargs)
+        kw["proxies"] = att["proxies"]
+        if att["impersonate"]:
+            kw["impersonate"] = att["impersonate"]
+        try:
+            resp = requests.request(method, url, **kw)
+            print(f"🔗 {method} {url} 成功 via {att['label']}")
+            return resp
+        except Exception as e:
+            print(f"⚠️ {method} {url} 失败 via {att['label']}: {e}")
+            last_exc = e
+    raise last_exc
+
 def send_tg_notification(message: str):
     """发送 Telegram 通知"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -54,8 +87,8 @@ def send_tg_notification(message: str):
     payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
 
     try:
-        resp = requests.post(
-            url, json=payload, timeout=10, impersonate="chrome", proxies=build_proxies()
+        resp = request_with_fallback(
+            "POST", url, json=payload, timeout=10
         )
         if resp.status_code == 200:
             print("✅ TG 通知发送成功")
@@ -127,12 +160,11 @@ def renew_server(server_id: str):
     url = f"{SITE_ORIGIN}/api/bots/{server_id}/renew"
 
     try:
-        response = requests.post(
+        response = request_with_fallback(
+            "POST",
             url,
             headers=login_headers(),
             timeout=15,
-            impersonate="chrome",
-            proxies=build_proxies(),
         )
 
         if response.status_code == 200:
@@ -159,8 +191,8 @@ def renew_server(server_id: str):
 
 STATE_RE = re.compile(r"[?&]state=([^&]+)")
 
-def discord_authorize(state: str) -> str:
-    """用 DISCORD_TOKEN 请求 Discord OAuth2 API 授权，返回带 code 的回调 location"""
+def discord_authorize(state: str, proxies=None, impersonate=None) -> str:
+    """用 DISCORD_TOKEN 请求 Discord OAuth2 API 授权，返回带 code 的回调 location（传输配置由调用方传入）"""
     query = urllib.parse.urlencode({
         "client_id":     DISCORD_CLIENT_ID,
         "redirect_uri":  OAUTH_REDIRECT_URI,
@@ -202,16 +234,12 @@ def discord_authorize(state: str) -> str:
 
     data = None
 
-    # 途径1：curl_cffi 直连（CI/有代理环境通常可用）
+    # 途径1：curl_cffi（传输配置由调用方传入，兜底在外层循环）
     try:
-        resp = requests.post(
-            authorize_url,
-            headers=headers,
-            data=body,
-            timeout=12,
-            impersonate="chrome",
-            proxies=build_proxies(),
-        )
+        post_kwargs = dict(headers=headers, data=body, timeout=12, proxies=proxies)
+        if impersonate:
+            post_kwargs["impersonate"] = impersonate
+        resp = requests.post(authorize_url, **post_kwargs)
         if resp.status_code == 200:
             data = resp.json()
         else:
@@ -231,23 +259,13 @@ def discord_authorize(state: str) -> str:
     print(f"✅ 拿到回调 URL: {re.sub(r'code=[^&]+', 'code=***', location)}")
     return location
 
-def fetch_new_cookie_via_http() -> str:
-    """纯 HTTP 完成 Discord OAuth 授权拿cookie：
-    1) GET /auth/login 拿 302 -> discord 授权页 URL（含 state），Session 自动种下 oauth_state cookie
-    2) DISCORD_TOKEN 调 Discord OAuth2 API 授权 -> 带 code 的回调 location
-    3) GET 回调 -> 302 到 /auth/success?code=<一次性code>（Session 自动带 state cookie）
-    4) POST /api/auth/exchange 用一次性 code 换取新 __Host-mrtcloud_token
-    curl_cffi 的 chrome TLS 指纹真实，不会被 Cloudflare 掐断。"""
-    if not DISCORD_TOKEN:
-        print("❌ 未配置 DISCORD_TOKEN，无法自动重新登录")
-        return ""
-
-    print("\n🔑 COOKIE 续期失败，切换到Discord OAuth登录获取新的Cookie...")
-
+def _fetch_new_cookie_once(proxies, impersonate) -> str:
+    """单次 OAuth 流程：1) GET /auth/login 拿 state；2) Discord 授权拿 code；
+    3) GET 回调拿一次性 code；4) POST /api/auth/exchange 换 token。传输配置由调用方传入。"""
     try:
-        sess = requests.Session(impersonate="chrome")
-        if IS_PROXY:
-            sess.proxies = build_proxies()
+        sess = requests.Session(impersonate=impersonate) if impersonate else requests.Session()
+        if proxies:
+            sess.proxies = proxies
 
         # 1) 触发 /auth/login，取授权 URL（含后端种下的 state）
         resp = sess.get(f"{API_ORIGIN}/auth/login", timeout=20, allow_redirects=False)
@@ -263,8 +281,8 @@ def fetch_new_cookie_via_http() -> str:
             return ""
         state = urllib.parse.unquote(m.group(1))
 
-        # 2) Discord 侧授权（带 DISCORD_TOKEN 的 API 调用）
-        location = discord_authorize(state)
+        # 2) Discord 侧授权（带 DISCORD_TOKEN 的 API 调用，传输配置与本轮一致）
+        location = discord_authorize(state, proxies=proxies, impersonate=impersonate)
         if not location:
             return ""
 
@@ -325,6 +343,21 @@ def fetch_new_cookie_via_http() -> str:
     except Exception as e:
         print(f"❌ HTTP OAuth 登录异常: {e}")
         return ""
+
+def fetch_new_cookie_via_http() -> str:
+    """纯 HTTP 完成 Discord OAuth 授权拿 cookie，传输失败时换配置重试一次"""
+    if not DISCORD_TOKEN:
+        print("❌ 未配置 DISCORD_TOKEN，无法自动重新登录")
+        return ""
+
+    print("\n🔑 COOKIE 续期失败，切换到Discord OAuth登录获取新的Cookie...")
+
+    for att in transport_attempts():
+        print(f"🔄 尝试 OAuth 登录 via {att['label']} ...")
+        token = _fetch_new_cookie_once(att["proxies"], att["impersonate"])
+        if token:
+            return token
+    return ""
 
 # ================= 主流程 =================
 def main():
