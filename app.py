@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 2026-11-08 传输兜底版：基于 app__4.py（仓库现行版），仅改传输层，其余逻辑、环境变量名一字未动。
-# 背景：11-08 12:11 那轮日志里，代理测试通过，但所有 curl_cffi 请求（续期 API、Discord OAuth、TG）
-# 全报 SSL 握手被掐断，连 Telegram 都不通——坏的是同一条出路（代理节点或 chrome 指纹），
-# 不是 MWS 站点、不是 COOKIE（本轮日志里 COOKIE 到期 2026-12-08，认证没问题）。
-# 兜底：先按原配置（代理+chrome 指纹）试，失败则改直连+无指纹重试一次，
-# 并把哪条路通了打到日志里，下轮日志即可定性是代理问题还是指纹问题。
+# 2026-11-08 captcha 识别版：基于 app__4-fixed.py（传输兜底版），其余逻辑、环境变量名一字未动。
+# 新增：续期 API 返回 captcha_required 时单独识别——换新 COOKIE 也没用，跳过 Discord OAuth，
+# 直接发 TG 提醒手动去面板延长；汇总通知里这类服务器也单独标注。
+# 背景：11-08 12:19 那轮直连已通，但续期 API 两次回 403 captcha_required（旧 COOKIE 与新 COOKIE 各一次），
+# 证明不是认证问题，是面板要求人工到 dashboard 确认。
 # 部署：改名回 app.py，覆盖仓库原文件，手动触发一次验证。
 
 import os
@@ -156,7 +155,7 @@ def get_expiry_from_cookie(value: str):
         return None
 
 def renew_server(server_id: str):
-    """调用续期 API，返回 (是否成功, HTTP 状态码, 剩余小时数)"""
+    """调用续期 API，返回 (是否成功, HTTP 状态码, 剩余小时数, 是否 captcha_required)"""
     url = f"{SITE_ORIGIN}/api/bots/{server_id}/renew"
 
     try:
@@ -174,14 +173,19 @@ def renew_server(server_id: str):
                 remaining_hours = "未知"
 
             print(f"✅ 服务器 [{server_id}] 续期成功，剩余 {remaining_hours} 小时")
-            return True, response.status_code, remaining_hours
+            return True, response.status_code, remaining_hours, False
 
-        print(f"❌ 服务器 [{server_id}] 续期失败，状态码: {response.status_code}, 响应: {response.text[:300]}")
-        return False, response.status_code, None
+        # 面板要求人工确认（验证码）时换新 COOKIE 也没用，单独认出来
+        is_captcha = "captcha_required" in response.text
+        if is_captcha:
+            print(f"🛑 服务器 [{server_id}] 面板要求人工确认（captcha_required），API 续期被拦，换新 COOKIE 也没用")
+        else:
+            print(f"❌ 服务器 [{server_id}] 续期失败，状态码: {response.status_code}, 响应: {response.text[:300]}")
+        return False, response.status_code, None, is_captcha
 
     except Exception as e:
         print(f"❌ 服务器 [{server_id}] 请求发生异常, 请检查服务器是否被删除: {e}")
-        return False, None, None
+        return False, None, None, False
 
 # ================= Discord OAuth 登录（API 请求失败时的兜底，纯 HTTP） =================
 #   1) GET /auth/login 拿授权 URL（含 state），Session 自动种下 oauth_state cookie
@@ -387,14 +391,17 @@ def main():
         print("ℹ️ 未配置 COOKIE，将直接走 Discord 登录流程")
 
     # ---------- 第一轮：使用现有 COOKIE 调续期 API ----------
-    results = {}      
+    results = {}
+    captcha_servers = []
     all_ok = True
     for s_id in server_list:
-        ok, status_code, remaining = renew_server(s_id)
+        ok, status_code, remaining, is_captcha = renew_server(s_id)
         results[s_id] = remaining if ok else None
+        if is_captcha:
+            captcha_servers.append(s_id)
         if not ok:
             all_ok = False
-            if status_code in (401, 403):
+            if status_code in (401, 403) and not is_captcha:
                 print(f"⚠️ [{s_id}] 认证失败（HTTP {status_code}），COOKIE 可能已失效")
         time.sleep(2)
 
@@ -402,6 +409,19 @@ def main():
 
     if all_ok:
         print("🏁 全部服务器续期成功，续期任务完成")
+    elif captcha_servers and len(captcha_servers) == sum(1 for v in results.values() if v is None):
+        # 全部失败都是 captcha_required：换新 COOKIE 也没用，跳过 OAuth，直接提醒手动去面板延长
+        print("🛑 全部失败均为 captcha_required，跳过 Discord OAuth，直接通知手动处理")
+        send_tg_notification(
+            "🇯🇵 MWS 续期通知\n\n"
+            "🛑 需要手动去面板延长\n"
+            f"🖥 服务器: {', '.join(f'[{s}]' for s in captcha_servers)}\n"
+            "⚠️ 面板要求人工确认（验证码），API 续不了，换新 COOKIE 也没用。\n"
+            f"👤 账户: {EMAIL}\n"
+            f"⏱️ 运行时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(time.time() + 8 * 3600))}"
+        )
+        print("🏁 脚本执行完毕")
+        return
     else:
         # ---------- COOKIE失效走第二轮：浏览器登录 Discord 获取新 COOKIE ----------
         if not DISCORD_TOKEN:
@@ -428,9 +448,14 @@ def main():
         # ---------- 用新 COOKIE 重新请求续期 API ----------
         print("\n🔁 使用新 COOKIE 重新请求续期 API ...")
         for s_id in server_list:
+            if s_id in captcha_servers:
+                print(f"⏭️ 跳过 [{s_id}]（captcha_required，换新 COOKIE 也没用）")
+                continue
             print(f"🔁 续期服务器 [{s_id}] ...")
-            ok2, _, remaining2 = renew_server(s_id)
+            ok2, _, remaining2, is_captcha2 = renew_server(s_id)
             results[s_id] = remaining2 if ok2 else None
+            if is_captcha2 and s_id not in captcha_servers:
+                captcha_servers.append(s_id)
             time.sleep(2)
 
         all_ok = all(v is not None for v in results.values())
@@ -445,7 +470,10 @@ def main():
         lines.append("⚠️ 部分服务器续期失败，请手动检查")
     for s_id, remaining in results.items():
         if remaining is None:
-            lines.append(f"🖥 服务器: [{s_id}] 续期失败")
+            if s_id in captcha_servers:
+                lines.append(f"🖥 服务器: [{s_id}] 需手动去面板延长（验证码）")
+            else:
+                lines.append(f"🖥 服务器: [{s_id}] 续期失败")
         else:
             lines.append(f"🖥 服务器: [{s_id}] 剩余 {remaining} H")
     lines.append(f"👤 续期账户: {EMAIL}")
